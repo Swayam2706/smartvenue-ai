@@ -1,0 +1,47 @@
+# Cloud Build config for frontend
+steps:
+  # Step 1: Build Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/smartvenue-frontend:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/smartvenue-frontend:latest'
+      - '--build-arg'
+      - 'VITE_API_URL=${_VITE_API_URL}'
+      - '--build-arg'
+      - 'VITE_WS_URL=${_VITE_WS_URL}'
+      - '.'
+
+  # Step 2: Push to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/smartvenue-frontend:$COMMIT_SHA'
+
+  # Step 3: Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'smartvenue-frontend'
+      - '--image=gcr.io/$PROJECT_ID/smartvenue-frontend:$COMMIT_SHA'
+      - '--region=us-central1'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--port=8080'
+      - '--min-instances=0'
+      - '--max-instances=3'
+      - '--memory=256Mi'
+      - '--cpu=1'
+
+images:
+  - 'gcr.io/$PROJECT_ID/smartvenue-frontend:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/smartvenue-frontend:latest'
+
+# Substitution variables (set in Cloud Build trigger)
+substitutions:
+  _VITE_API_URL: 'https://smartvenue-backend-xxxxx.run.app/api'
+  _VITE_WS_URL: 'wss://smartvenue-backend-xxxxx.run.app/ws'
