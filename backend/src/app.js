@@ -7,6 +7,8 @@ const compression = require('compression');
 const cookieParser = require('cookie-parser');
 const { sanitizeBody } = require('./utils/sanitize');
 const { performanceMonitoring } = require('./utils/performance');
+const { globalErrorHandler } = require('./utils/errorHandler');
+const { HTTP_STATUS } = require('./utils/constants');
 const requestId = require('./middleware/requestId');
 const logger = require('./utils/logger');
 
