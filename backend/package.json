@@ -19,7 +19,7 @@
     "audit:fix": "npm audit fix"
   },
   "dependencies": {
-    "@google-cloud/error-reporting": "^3.0.6",
+    "@google-cloud/error-reporting": "^4.0.0",
     "@google-cloud/logging": "^11.0.0",
     "@google-cloud/monitoring": "^4.0.0",
     "@google-cloud/pubsub": "^4.0.7",
