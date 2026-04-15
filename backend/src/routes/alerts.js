@@ -16,9 +16,12 @@ const { body, validationResult } = require('express-validator');
 const { authenticate, adminOnly } = require('../middleware/auth');
 const { broadcastAlert } = require('../websocket/wsServer');
 const { getCurrentState } = require('../simulation/crowdSimulator');
-const { pushAlertToFirebase } = require('../config/firebaseAdmin');
 const logger = require('../utils/logger');
 const { trackAnalyticsEvent } = require('../services/firebaseService');
+const { logAnalyticsEvent, storeAlert, sendPushNotification } = require('../config/firebaseAdmin');
+const { publishAlert } = require('../config/googleCloud');
+const { asyncHandler, ValidationError, NotFoundError } = require('../utils/errorHandler');
+const { HTTP_STATUS, ALERT_TYPES, VALIDATION } = require('../utils/constants');
 
 const router = express.Router();
 
@@ -107,26 +110,26 @@ function checkAutoAlerts() {
  *   "timestamp": "2024-01-15T10:30:00.000Z"
  * }
  */
-router.get('/', (req, res) => {
-  try {
-    checkAutoAlerts();
-    const active = alerts.filter(a => !a.acknowledged);
-    
-    // Track analytics event
-    trackAnalyticsEvent('alerts_viewed', {
-      total_alerts: alerts.length,
-      active_alerts: active.length,
-      critical_alerts: alerts.filter(a => a.type === 'critical').length
-    });
-    
-    res.json({ alerts, activeCount: active.length, timestamp: new Date().toISOString() });
-    
-    logger.info('Alerts retrieved', { total: alerts.length, active: active.length });
-  } catch (error) {
-    logger.error('Error retrieving alerts', { error: error.message });
-    res.status(500).json({ error: 'Failed to retrieve alerts' });
-  }
-});
+router.get('/', asyncHandler(async (req, res) => {
+  checkAutoAlerts();
+  const active = alerts.filter(a => !a.acknowledged);
+  const criticalCount = alerts.filter(a => a.type === ALERT_TYPES.CRITICAL).length;
+  
+  // Track analytics event to Firebase
+  await logAnalyticsEvent('alerts_viewed', {
+    total_alerts: alerts.length,
+    active_alerts: active.length,
+    critical_alerts: criticalCount
+  });
+  
+  res.status(HTTP_STATUS.OK).json({ 
+    alerts, 
+    activeCount: active.length, 
+    timestamp: new Date().toISOString() 
+  });
+  
+  logger.info('Alerts retrieved', { total: alerts.length, active: active.length });
+}));
 
 /**
  * POST /api/alerts
@@ -151,49 +154,56 @@ router.get('/', (req, res) => {
  * }
  */
 router.post('/', authenticate, adminOnly, [
-  body('type').isIn(['info', 'warning', 'critical', 'evacuation']),
-  body('title').trim().notEmpty(),
-  body('message').trim().notEmpty()
-], (req, res) => {
+  body('type').isIn([ALERT_TYPES.INFO, ALERT_TYPES.WARNING, ALERT_TYPES.CRITICAL, ALERT_TYPES.EVACUATION]),
+  body('title').trim().notEmpty().isLength({ max: VALIDATION.TITLE_MAX }),
+  body('message').trim().notEmpty().isLength({ max: VALIDATION.DESCRIPTION_MAX })
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    logger.warn('Alert creation validation failed', { errors: errors.array() });
+    throw new ValidationError('Validation failed', errors.array());
+  }
+
+  const alert = {
+    id: alertIdCounter++,
+    ...req.body,
+    auto: false,
+    createdBy: req.user.username,
+    timestamp: new Date().toISOString(),
+    acknowledged: false
+  };
+
+  alerts.unshift(alert);
+  broadcastAlert(alert);
+  
+  // Store alert in Firebase Realtime Database
+  await storeAlert(alert);
+  
+  // Publish alert to Google Cloud Pub/Sub
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      logger.warn('Alert creation validation failed', { errors: errors.array() });
-      return res.status(400).json({ errors: errors.array() });
-    }
-
-    const alert = {
-      id: alertIdCounter++,
-      ...req.body,
-      auto: false,
-      createdBy: req.user.username,
-      timestamp: new Date().toISOString(),
-      acknowledged: false
-    };
-
-    alerts.unshift(alert);
-    broadcastAlert(alert);
-    pushAlertToFirebase(alert);
-
-    // Track analytics event
-    trackAnalyticsEvent('alert_created', {
-      alert_type: alert.type,
-      created_by: req.user.username,
-      alert_id: alert.id
-    });
-
-    res.status(201).json({ alert });
-    
-    logger.info('Manual alert created', { 
-      alertId: alert.id, 
+    await publishAlert(alert, { 
       type: alert.type, 
-      createdBy: req.user.username 
+      priority: alert.type === ALERT_TYPES.CRITICAL ? 'high' : 'normal' 
     });
   } catch (error) {
-    logger.error('Error creating alert', { error: error.message });
-    res.status(500).json({ error: 'Failed to create alert' });
+    logger.debug('Pub/Sub publish skipped', { error: error.message });
   }
-});
+
+  // Track analytics event to Firebase
+  await logAnalyticsEvent('alert_created', {
+    alert_type: alert.type,
+    created_by: req.user.username,
+    alert_id: alert.id
+  });
+
+  res.status(HTTP_STATUS.CREATED).json({ alert });
+  
+  logger.info('Manual alert created', { 
+    alertId: alert.id, 
+    type: alert.type, 
+    createdBy: req.user.username 
+  });
+}));
 
 /**
  * PATCH /api/alerts/:id/acknowledge
@@ -207,37 +217,32 @@ router.post('/', authenticate, adminOnly, [
  * @returns {Object} 401 - Unauthorized
  * @returns {Object} 500 - Internal server error
  */
-router.patch('/:id/acknowledge', authenticate, (req, res) => {
-  try {
-    const alert = alerts.find(a => a.id === parseInt(req.params.id));
-    
-    if (!alert) {
-      logger.warn('Alert not found for acknowledgment', { alertId: req.params.id });
-      return res.status(404).json({ error: 'Alert not found' });
-    }
-
-    alert.acknowledged = true;
-    alert.acknowledgedBy = req.user.username;
-    alert.acknowledgedAt = new Date().toISOString();
-
-    // Track analytics event
-    trackAnalyticsEvent('alert_acknowledged', {
-      alert_id: alert.id,
-      alert_type: alert.type,
-      acknowledged_by: req.user.username
-    });
-
-    res.json({ alert });
-    
-    logger.info('Alert acknowledged', { 
-      alertId: alert.id, 
-      acknowledgedBy: req.user.username 
-    });
-  } catch (error) {
-    logger.error('Error acknowledging alert', { alertId: req.params.id, error: error.message });
-    res.status(500).json({ error: 'Failed to acknowledge alert' });
+router.patch('/:id/acknowledge', authenticate, asyncHandler(async (req, res) => {
+  const alert = alerts.find(a => a.id === parseInt(req.params.id));
+  
+  if (!alert) {
+    logger.warn('Alert not found for acknowledgment', { alertId: req.params.id });
+    throw new NotFoundError('Alert');
   }
-});
+
+  alert.acknowledged = true;
+  alert.acknowledgedBy = req.user.username;
+  alert.acknowledgedAt = new Date().toISOString();
+
+  // Track analytics event to Firebase
+  await logAnalyticsEvent('alert_acknowledged', {
+    alert_id: alert.id,
+    alert_type: alert.type,
+    acknowledged_by: req.user.username
+  });
+
+  res.status(HTTP_STATUS.OK).json({ alert });
+  
+  logger.info('Alert acknowledged', { 
+    alertId: alert.id, 
+    acknowledgedBy: req.user.username 
+  });
+}));
 
 /**
  * POST /api/alerts/emergency
@@ -256,42 +261,61 @@ router.patch('/:id/acknowledge', authenticate, (req, res) => {
  *   "message": "Fire detected in North Stand. Evacuate immediately."
  * }
  */
-router.post('/emergency', authenticate, adminOnly, (req, res) => {
+router.post('/emergency', authenticate, adminOnly, asyncHandler(async (req, res) => {
+  const alert = {
+    id: alertIdCounter++,
+    type: ALERT_TYPES.EVACUATION,
+    title: '🚨 EMERGENCY EVACUATION',
+    message: req.body.message || 'Emergency evacuation in progress. Please follow safe exit routes immediately.',
+    auto: false,
+    createdBy: req.user.username,
+    timestamp: new Date().toISOString(),
+    acknowledged: false,
+    safeZones: ['gate-a', 'gate-b', 'gate-c', 'gate-d'],
+    priority: 'CRITICAL'
+  };
+
+  alerts.unshift(alert);
+  broadcastAlert(alert);
+  
+  // Store in Firebase
+  await storeAlert(alert);
+  
+  // Publish to Pub/Sub with high priority
   try {
-    const alert = {
-      id: alertIdCounter++,
-      type: 'evacuation',
-      title: '🚨 EMERGENCY EVACUATION',
-      message: req.body.message || 'Emergency evacuation in progress. Please follow safe exit routes immediately.',
-      auto: false,
-      createdBy: req.user.username,
-      timestamp: new Date().toISOString(),
-      acknowledged: false,
-      safeZones: ['gate-a', 'gate-b', 'gate-c', 'gate-d'],
-      priority: 'CRITICAL'
-    };
-
-    alerts.unshift(alert);
-    broadcastAlert(alert);
-    pushAlertToFirebase(alert);
-
-    // Track analytics event
-    trackAnalyticsEvent('emergency_alert_triggered', {
-      alert_id: alert.id,
-      triggered_by: req.user.username,
-      timestamp: alert.timestamp
-    });
-
-    res.status(201).json({ alert, message: 'Emergency alert broadcast to all clients' });
-    
-    logger.warn('EMERGENCY ALERT TRIGGERED', { 
-      alertId: alert.id, 
-      triggeredBy: req.user.username 
-    });
+    await publishAlert(alert, { type: 'emergency', priority: 'critical' });
   } catch (error) {
-    logger.error('Error triggering emergency alert', { error: error.message });
-    res.status(500).json({ error: 'Failed to trigger emergency alert' });
+    logger.debug('Pub/Sub publish skipped', { error: error.message });
   }
-});
+  
+  // Send push notifications
+  try {
+    await sendPushNotification(
+      alert.title,
+      alert.message,
+      [], // Would contain FCM tokens in production
+      { alert_id: alert.id.toString(), type: 'emergency' }
+    );
+  } catch (error) {
+    logger.debug('Push notification skipped', { error: error.message });
+  }
+
+  // Track analytics event to Firebase
+  await logAnalyticsEvent('emergency_alert_triggered', {
+    alert_id: alert.id,
+    triggered_by: req.user.username,
+    timestamp: alert.timestamp
+  });
+
+  res.status(HTTP_STATUS.CREATED).json({ 
+    alert, 
+    message: 'Emergency alert broadcast to all clients' 
+  });
+  
+  logger.warn('EMERGENCY ALERT TRIGGERED', { 
+    alertId: alert.id, 
+    triggeredBy: req.user.username 
+  });
+}));
 
 module.exports = router;

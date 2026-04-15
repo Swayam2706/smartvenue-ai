@@ -11,6 +11,10 @@ const express = require('express');
 const crowdService = require('../services/crowdService');
 const logger = require('../utils/logger');
 const { trackAnalyticsEvent } = require('../services/firebaseService');
+const { logAnalyticsEvent, storeCrowdData } = require('../config/firebaseAdmin');
+const { writeMetric } = require('../config/googleCloud');
+const { asyncHandler, NotFoundError } = require('../utils/errorHandler');
+const { HTTP_STATUS, CACHE_TTL } = require('../utils/constants');
 
 const router = express.Router();
 
@@ -38,25 +42,26 @@ const router = express.Router();
  *   "timestamp": "2024-01-15T10:30:00.000Z"
  * }
  */
-router.get('/zones', (req, res) => {
-  try {
-    const zones = crowdService.getAllZones();
-    
-    // Track analytics event
-    trackAnalyticsEvent('crowd_zones_viewed', {
-      zone_count: zones.length,
-      timestamp: new Date().toISOString()
-    });
-    
-    res.set('Cache-Control', 'public, max-age=4');
-    res.json({ zones, timestamp: new Date().toISOString() });
-    
-    logger.info('Crowd zones retrieved', { count: zones.length });
-  } catch (error) {
-    logger.error('Error retrieving crowd zones', { error: error.message });
-    res.status(500).json({ error: 'Failed to retrieve crowd zones' });
-  }
-});
+router.get('/zones', asyncHandler(async (req, res) => {
+  const zones = crowdService.getAllZones();
+  
+  // Track analytics event to Firebase
+  await logAnalyticsEvent('crowd_zones_viewed', {
+    zone_count: zones.length,
+    timestamp: new Date().toISOString()
+  });
+  
+  // Store crowd data in Firebase Realtime Database
+  await storeCrowdData({ zones, timestamp: new Date().toISOString() });
+  
+  // Write metric to Cloud Monitoring
+  await writeMetric('crowd/zones_count', zones.length, { endpoint: '/zones' });
+  
+  res.set('Cache-Control', `public, max-age=${CACHE_TTL.SHORT / 1000}`);
+  res.status(HTTP_STATUS.OK).json({ zones, timestamp: new Date().toISOString() });
+  
+  logger.info('Crowd zones retrieved', { count: zones.length });
+}));
 
 /**
  * GET /api/crowd/zones/:id
@@ -85,32 +90,34 @@ router.get('/zones', (req, res) => {
  *   "timestamp": "2024-01-15T10:30:00.000Z"
  * }
  */
-router.get('/zones/:id', (req, res) => {
-  try {
-    const { id } = req.params;
-    const zone = crowdService.getZoneById(id);
-    
-    if (!zone) {
-      logger.warn('Zone not found', { zoneId: id });
-      return res.status(404).json({ error: 'Zone not found' });
-    }
-    
-    // Track analytics event
-    trackAnalyticsEvent('zone_detail_viewed', {
-      zone_id: id,
-      zone_name: zone.name,
-      density: zone.current,
-      risk_level: zone.riskLevel
-    });
-    
-    res.json({ zone, timestamp: new Date().toISOString() });
-    
-    logger.info('Zone details retrieved', { zoneId: id, density: zone.current });
-  } catch (error) {
-    logger.error('Error retrieving zone details', { zoneId: req.params.id, error: error.message });
-    res.status(500).json({ error: 'Failed to retrieve zone details' });
+router.get('/zones/:id', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const zone = crowdService.getZoneById(id);
+  
+  if (!zone) {
+    logger.warn('Zone not found', { zoneId: id });
+    throw new NotFoundError('Zone');
   }
-});
+  
+  // Track analytics event to Firebase
+  await logAnalyticsEvent('zone_detail_viewed', {
+    zone_id: id,
+    zone_name: zone.name,
+    density: zone.current,
+    risk_level: zone.riskLevel
+  });
+  
+  // Write zone density metric to Cloud Monitoring
+  await writeMetric('crowd/zone_density', zone.current, {
+    zone_id: id,
+    zone_name: zone.name,
+    risk_level: zone.riskLevel
+  });
+  
+  res.status(HTTP_STATUS.OK).json({ zone, timestamp: new Date().toISOString() });
+  
+  logger.info('Zone details retrieved', { zoneId: id, density: zone.current });
+}));
 
 /**
  * GET /api/crowd/heatmap
@@ -140,25 +147,24 @@ router.get('/zones/:id', (req, res) => {
  *   "timestamp": "2024-01-15T10:30:00.000Z"
  * }
  */
-router.get('/heatmap', (req, res) => {
-  try {
-    const heatmap = crowdService.getHeatmapData();
-    
-    // Track analytics event
-    trackAnalyticsEvent('heatmap_viewed', {
-      zone_count: heatmap.length,
-      high_risk_zones: heatmap.filter(z => z.riskLevel === 'high' || z.riskLevel === 'critical').length
-    });
-    
-    res.set('Cache-Control', 'public, max-age=4');
-    res.json({ heatmap, timestamp: new Date().toISOString() });
-    
-    logger.info('Heatmap data retrieved', { zones: heatmap.length });
-  } catch (error) {
-    logger.error('Error retrieving heatmap data', { error: error.message });
-    res.status(500).json({ error: 'Failed to retrieve heatmap data' });
-  }
-});
+router.get('/heatmap', asyncHandler(async (req, res) => {
+  const heatmap = crowdService.getHeatmapData();
+  const highRiskZones = heatmap.filter(z => z.riskLevel === 'high' || z.riskLevel === 'critical').length;
+  
+  // Track analytics event to Firebase
+  await logAnalyticsEvent('heatmap_viewed', {
+    zone_count: heatmap.length,
+    high_risk_zones: highRiskZones
+  });
+  
+  // Write high-risk zones metric to Cloud Monitoring
+  await writeMetric('crowd/high_risk_zones', highRiskZones, { endpoint: '/heatmap' });
+  
+  res.set('Cache-Control', `public, max-age=${CACHE_TTL.SHORT / 1000}`);
+  res.status(HTTP_STATUS.OK).json({ heatmap, timestamp: new Date().toISOString() });
+  
+  logger.info('Heatmap data retrieved', { zones: heatmap.length, highRiskZones });
+}));
 
 /**
  * GET /api/crowd/summary
@@ -183,28 +189,27 @@ router.get('/heatmap', (req, res) => {
  *   "timestamp": "2024-01-15T10:30:00.000Z"
  * }
  */
-router.get('/summary', (req, res) => {
-  try {
-    const summary = crowdService.getSummary();
-    
-    // Track analytics event
-    trackAnalyticsEvent('crowd_summary_viewed', {
-      occupancy_rate: parseFloat(summary.occupancyRate),
-      critical_zones: summary.criticalZones,
-      high_risk_zones: summary.highRiskZones
-    });
-    
-    res.set('Cache-Control', 'public, max-age=4');
-    res.json({ ...summary, timestamp: new Date().toISOString() });
-    
-    logger.info('Crowd summary retrieved', { 
-      occupancy: summary.occupancyRate, 
-      criticalZones: summary.criticalZones 
-    });
-  } catch (error) {
-    logger.error('Error retrieving crowd summary', { error: error.message });
-    res.status(500).json({ error: 'Failed to retrieve crowd summary' });
-  }
-});
+router.get('/summary', asyncHandler(async (req, res) => {
+  const summary = crowdService.getSummary();
+  
+  // Track analytics event to Firebase
+  await logAnalyticsEvent('crowd_summary_viewed', {
+    occupancy_rate: parseFloat(summary.occupancyRate),
+    critical_zones: summary.criticalZones,
+    high_risk_zones: summary.highRiskZones
+  });
+  
+  // Write occupancy metrics to Cloud Monitoring
+  await writeMetric('crowd/occupancy_rate', parseFloat(summary.occupancyRate), { endpoint: '/summary' });
+  await writeMetric('crowd/critical_zones', summary.criticalZones, { endpoint: '/summary' });
+  
+  res.set('Cache-Control', `public, max-age=${CACHE_TTL.SHORT / 1000}`);
+  res.status(HTTP_STATUS.OK).json({ ...summary, timestamp: new Date().toISOString() });
+  
+  logger.info('Crowd summary retrieved', { 
+    occupancy: summary.occupancyRate, 
+    criticalZones: summary.criticalZones 
+  });
+}));
 
 module.exports = router;

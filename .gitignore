@@ -1,5 +1,21 @@
 node_modules/
 dist/
+build/
 .env
+.env.local
+.env.production
+.env.development
 *.log
 .DS_Store
+coverage/
+.vscode/
+.idea/
+
+# Secrets and credentials
+*.pem
+*.key
+serviceAccountKey.json
+firebase-adminsdk-*.json
+
+# OS files
+Thumbs.db

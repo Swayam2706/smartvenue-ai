@@ -7,7 +7,16 @@
 
 import { initializeApp } from 'firebase/app';
 import { getAnalytics, logEvent, setUserId, setUserProperties } from 'firebase/analytics';
-import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged } from 'firebase/auth';
+import { 
+  getAuth, 
+  signInWithEmailAndPassword, 
+  signInWithPopup,
+  GoogleAuthProvider,
+  createUserWithEmailAndPassword,
+  updateProfile,
+  signOut, 
+  onAuthStateChanged 
+} from 'firebase/auth';
 import { getDatabase, ref, onValue, set, push, update } from 'firebase/database';
 import { getStorage, ref as storageRef, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { getPerformance, trace } from 'firebase/performance';
@@ -15,17 +24,18 @@ import { getMessaging, getToken, onMessage } from 'firebase/messaging';
 
 /**
  * Firebase Configuration
- * Production credentials for SmartVenue AI
+ * Uses environment variables for security
+ * Configure these in your .env file
  */
 const firebaseConfig = {
-  apiKey: "AIzaSyC9cASwY265oGk4YFlJ54rpiRCgOD-KOEw",
-  authDomain: "smartvenue-ai-eda90.firebaseapp.com",
-  databaseURL: "https://smartvenue-ai-eda90-default-rtdb.firebaseio.com",
-  projectId: "smartvenue-ai-eda90",
-  storageBucket: "smartvenue-ai-eda90.firebasestorage.app",
-  messagingSenderId: "890749235852",
-  appId: "1:890749235852:web:39a10c9573c8d0294d81a9",
-  measurementId: "G-YR6C99CD6R"
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  databaseURL: import.meta.env.VITE_FIREBASE_DATABASE_URL,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+  measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID
 };
 
 // Initialize Firebase App
@@ -371,3 +381,183 @@ export {
 
 // Auto-initialize on module load
 initializeFirebase();
+
+/**
+ * Sign in with Google
+ * 
+ * @returns {Promise<Object>} User data and token
+ */
+export async function signInWithGoogle() {
+  if (!auth) {
+    throw new Error('Firebase Auth not initialized');
+  }
+
+  try {
+    const provider = new GoogleAuthProvider();
+    provider.addScope('profile');
+    provider.addScope('email');
+    
+    const result = await signInWithPopup(auth, provider);
+    const user = result.user;
+    
+    // Track Google sign-in
+    if (analytics) {
+      logEvent(analytics, 'login', {
+        method: 'google',
+        user_id: user.uid
+      });
+    }
+    
+    // Get ID token for backend
+    const token = await user.getIdToken();
+    
+    return {
+      user: {
+        id: user.uid,
+        email: user.email,
+        name: user.displayName,
+        photoURL: user.photoURL,
+        role: 'user'
+      },
+      token
+    };
+  } catch (error) {
+    console.error('Google sign-in failed:', error);
+    throw error;
+  }
+}
+
+/**
+ * Sign up with Google
+ * 
+ * @returns {Promise<Object>} User data and token
+ */
+export async function signUpWithGoogle() {
+  // Same as sign in for Google OAuth
+  return signInWithGoogle();
+}
+
+/**
+ * Create user with email and password
+ * 
+ * @param {string} name - User's full name
+ * @param {string} email - User's email
+ * @param {string} password - User's password
+ * @returns {Promise<Object>} User data and token
+ */
+export async function createUserWithEmail(name, email, password) {
+  if (!auth) {
+    throw new Error('Firebase Auth not initialized');
+  }
+
+  try {
+    const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+    const user = userCredential.user;
+    
+    // Update profile with name
+    await updateProfile(user, {
+      displayName: name
+    });
+    
+    // Track sign up
+    if (analytics) {
+      logEvent(analytics, 'sign_up', {
+        method: 'email',
+        user_id: user.uid
+      });
+    }
+    
+    // Get ID token
+    const token = await user.getIdToken();
+    
+    return {
+      user: {
+        id: user.uid,
+        email: user.email,
+        name: name,
+        photoURL: user.photoURL,
+        role: 'user'
+      },
+      token
+    };
+  } catch (error) {
+    console.error('Email sign-up failed:', error);
+    throw error;
+  }
+}
+
+/**
+ * Sign in with email and password
+ * 
+ * @param {string} email - User's email
+ * @param {string} password - User's password
+ * @returns {Promise<Object>} User data and token
+ */
+export async function signInWithEmail(email, password) {
+  if (!auth) {
+    throw new Error('Firebase Auth not initialized');
+  }
+
+  try {
+    const userCredential = await signInWithEmailAndPassword(auth, email, password);
+    const user = userCredential.user;
+    
+    // Track sign in
+    if (analytics) {
+      logEvent(analytics, 'login', {
+        method: 'email',
+        user_id: user.uid
+      });
+    }
+    
+    // Get ID token
+    const token = await user.getIdToken();
+    
+    return {
+      user: {
+        id: user.uid,
+        email: user.email,
+        name: user.displayName || email.split('@')[0],
+        photoURL: user.photoURL,
+        role: 'user'
+      },
+      token
+    };
+  } catch (error) {
+    console.error('Email sign-in failed:', error);
+    throw error;
+  }
+}
+
+/**
+ * Check if Firebase is configured
+ * 
+ * @returns {boolean} Configuration status
+ */
+export function isFirebaseConfigured() {
+  return !!auth && !!analytics;
+}
+
+/**
+ * Get Firebase auth error message
+ * 
+ * @param {string} errorCode - Firebase error code
+ * @returns {string} User-friendly error message
+ */
+export function getFirebaseErrorMessage(errorCode) {
+  const errorMessages = {
+    'auth/email-already-in-use': 'This email is already registered',
+    'auth/invalid-email': 'Invalid email address',
+    'auth/operation-not-allowed': 'Operation not allowed',
+    'auth/weak-password': 'Password is too weak',
+    'auth/user-disabled': 'This account has been disabled',
+    'auth/user-not-found': 'No account found with this email',
+    'auth/wrong-password': 'Incorrect password',
+    'auth/too-many-requests': 'Too many attempts. Please try again later',
+    'auth/network-request-failed': 'Network error. Please check your connection',
+    'auth/popup-closed-by-user': 'Sign-in popup was closed',
+    'auth/cancelled-popup-request': 'Sign-in was cancelled'
+  };
+  
+  return errorMessages[errorCode] || 'Authentication failed. Please try again.';
+}

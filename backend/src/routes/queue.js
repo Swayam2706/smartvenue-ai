@@ -11,6 +11,10 @@ const express = require('express');
 const { getCurrentState } = require('../simulation/crowdSimulator');
 const logger = require('../utils/logger');
 const { trackAnalyticsEvent } = require('../services/firebaseService');
+const { logAnalyticsEvent } = require('../config/firebaseAdmin');
+const { writeMetric } = require('../config/googleCloud');
+const { asyncHandler, ValidationError } = require('../utils/errorHandler');
+const { HTTP_STATUS } = require('../utils/constants');
 
 const router = express.Router();
 
@@ -94,31 +98,32 @@ function getQueueData(zoneId, state) {
  *   "timestamp": "2024-01-15T10:30:00.000Z"
  * }
  */
-router.get('/all', (req, res) => {
-  try {
-    const state = getCurrentState();
-    const result = {};
-    let totalQueues = 0;
+router.get('/all', asyncHandler(async (req, res) => {
+  const state = getCurrentState();
+  const result = {};
+  let totalQueues = 0;
 
-    Object.entries(QUEUE_CATEGORIES).forEach(([category, ids]) => {
-      result[category] = ids.map(id => getQueueData(id, state)).filter(Boolean);
-      totalQueues += result[category].length;
-    });
+  Object.entries(QUEUE_CATEGORIES).forEach(([category, ids]) => {
+    result[category] = ids.map(id => getQueueData(id, state)).filter(Boolean);
+    totalQueues += result[category].length;
+  });
 
-    // Track analytics event
-    trackAnalyticsEvent('queue_all_viewed', {
-      total_queues: totalQueues,
-      categories: Object.keys(QUEUE_CATEGORIES).length
-    });
+  // Track analytics event to Firebase
+  await logAnalyticsEvent('queue_all_viewed', {
+    total_queues: totalQueues,
+    categories: Object.keys(QUEUE_CATEGORIES).length
+  });
+  
+  // Write metric to Cloud Monitoring
+  await writeMetric('queue/total_queues', totalQueues, { endpoint: '/all' });
 
-    res.json({ queues: result, timestamp: new Date().toISOString() });
-    
-    logger.info('All queue data retrieved', { totalQueues });
-  } catch (error) {
-    logger.error('Error retrieving queue data', { error: error.message });
-    res.status(500).json({ error: 'Failed to retrieve queue data' });
-  }
-});
+  res.status(HTTP_STATUS.OK).json({ 
+    queues: result, 
+    timestamp: new Date().toISOString() 
+  });
+  
+  logger.info('All queue data retrieved', { totalQueues });
+}));
 
 /**
  * GET /api/queue/:category
@@ -143,55 +148,51 @@ router.get('/all', (req, res) => {
  *   "timestamp": "2024-01-15T10:30:00.000Z"
  * }
  */
-router.get('/:category', (req, res) => {
-  try {
-    const { category } = req.params;
-    
-    if (!QUEUE_CATEGORIES[category]) {
-      logger.warn('Invalid queue category requested', { category });
-      return res.status(404).json({ 
-        error: 'Category not found. Use: gates, food, restrooms' 
-      });
-    }
-
-    const state = getCurrentState();
-    const queues = QUEUE_CATEGORIES[category]
-      .map(id => getQueueData(id, state))
-      .filter(Boolean);
-
-    // Find best option (least wait)
-    const best = queues.reduce(
-      (min, q) => q.currentWait < min.currentWait ? q : min, 
-      queues[0]
-    );
-
-    // Track analytics event
-    trackAnalyticsEvent('queue_category_viewed', {
-      category,
-      queue_count: queues.length,
-      best_wait_time: best.currentWait,
-      avg_wait_time: Math.floor(queues.reduce((sum, q) => sum + q.currentWait, 0) / queues.length)
-    });
-
-    res.json({ 
-      category, 
-      queues, 
-      bestOption: best, 
-      timestamp: new Date().toISOString() 
-    });
-    
-    logger.info('Queue category retrieved', { 
-      category, 
-      count: queues.length, 
-      bestWait: best.currentWait 
-    });
-  } catch (error) {
-    logger.error('Error retrieving queue category', { 
-      category: req.params.category, 
-      error: error.message 
-    });
-    res.status(500).json({ error: 'Failed to retrieve queue data' });
+router.get('/:category', asyncHandler(async (req, res) => {
+  const { category } = req.params;
+  
+  if (!QUEUE_CATEGORIES[category]) {
+    logger.warn('Invalid queue category requested', { category });
+    throw new ValidationError(`Category not found. Use: ${Object.keys(QUEUE_CATEGORIES).join(', ')}`);
   }
-});
+
+  const state = getCurrentState();
+  const queues = QUEUE_CATEGORIES[category]
+    .map(id => getQueueData(id, state))
+    .filter(Boolean);
+
+  // Find best option (least wait)
+  const best = queues.reduce(
+    (min, q) => q.currentWait < min.currentWait ? q : min, 
+    queues[0]
+  );
+  
+  const avgWaitTime = Math.floor(queues.reduce((sum, q) => sum + q.currentWait, 0) / queues.length);
+
+  // Track analytics event to Firebase
+  await logAnalyticsEvent('queue_category_viewed', {
+    category,
+    queue_count: queues.length,
+    best_wait_time: best.currentWait,
+    avg_wait_time: avgWaitTime
+  });
+  
+  // Write metrics to Cloud Monitoring
+  await writeMetric('queue/avg_wait_time', avgWaitTime, { category });
+  await writeMetric('queue/best_wait_time', best.currentWait, { category });
+
+  res.status(HTTP_STATUS.OK).json({ 
+    category, 
+    queues, 
+    bestOption: best, 
+    timestamp: new Date().toISOString() 
+  });
+  
+  logger.info('Queue category retrieved', { 
+    category, 
+    count: queues.length, 
+    bestWait: best.currentWait 
+  });
+}));
 
 module.exports = router;

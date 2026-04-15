@@ -14,7 +14,10 @@
 const express = require('express');
 const { body, validationResult } = require('express-validator');
 const { getCurrentState, getZones } = require('../simulation/crowdSimulator');
-const { logAnalyticsEvent } = require('../services/firebaseService');
+const { logAnalyticsEvent } = require('../config/firebaseAdmin');
+const { writeMetric } = require('../config/googleCloud');
+const { asyncHandler, ValidationError } = require('../utils/errorHandler');
+const { HTTP_STATUS, CACHE_TTL } = require('../utils/constants');
 const logger = require('../utils/logger');
 
 const router = express.Router();
@@ -187,11 +190,11 @@ router.post('/route', [
   body('from').notEmpty().withMessage('Origin required'),
   body('to').notEmpty().withMessage('Destination required'),
   body('preference').optional().isIn(['fastest', 'least_crowded', 'balanced'])
-], async (req, res) => {
+], asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
     logger.warn('Navigation route validation failed', { errors: errors.array() });
-    return res.status(400).json({ errors: errors.array() });
+    throw new ValidationError('Validation failed', errors.array());
   }
 
   const { from, to, preference = 'balanced' } = req.body;
@@ -202,75 +205,79 @@ router.post('/route', [
   const zoneIds = zones.map(z => z.id);
   if (!zoneIds.includes(from)) {
     logger.warn('Invalid origin zone', { from });
-    return res.status(400).json({ error: 'Invalid origin zone' });
+    throw new ValidationError('Invalid origin zone');
   }
   if (!zoneIds.includes(to)) {
     logger.warn('Invalid destination zone', { to });
-    return res.status(400).json({ error: 'Invalid destination zone' });
+    throw new ValidationError('Invalid destination zone');
   }
 
-  try {
-    // Build graph and calculate route
-    const graph = buildGraph(crowdState);
-    const result = dijkstra(graph, from, to);
+  // Build graph and calculate route
+  const graph = buildGraph(crowdState);
+  const result = dijkstra(graph, from, to);
 
-    if (!result.reachable) {
-      logger.info('No route found', { from, to });
-      return res.status(404).json({ error: 'No route found between these zones' });
-    }
-
-    // Build detailed route information
-    const routeDetails = result.path.map(zoneId => {
-      const zone = zones.find(z => z.id === zoneId);
-      const state = crowdState[zoneId];
-      return {
-        id: zoneId,
-        name: zone?.name || zoneId,
-        x: zone?.x,
-        y: zone?.y,
-        density: state?.current || 0,
-        riskLevel: state?.riskLevel || 'low',
-        waitTime: state?.waitTime || 0
-      };
+  if (!result.reachable) {
+    logger.info('No route found', { from, to });
+    return res.status(HTTP_STATUS.NOT_FOUND).json({ 
+      error: 'No route found between these zones' 
     });
+  }
 
-    const totalWait = routeDetails.reduce((sum, z) => sum + z.waitTime, 0);
-    const avgDensity = routeDetails.reduce((sum, z) => sum + z.density, 0) / routeDetails.length;
-    const score = calculateRouteScore(routeDetails);
-
-    const response = {
-      route: routeDetails,
-      totalSteps: result.path.length,
-      estimatedTime: Math.ceil(result.path.length * 2 + totalWait * 0.3),
-      totalWaitTime: totalWait,
-      avgCrowdDensity: avgDensity.toFixed(3),
-      routeScore: parseInt(score),
-      preference,
-      timestamp: new Date().toISOString()
+  // Build detailed route information
+  const routeDetails = result.path.map(zoneId => {
+    const zone = zones.find(z => z.id === zoneId);
+    const state = crowdState[zoneId];
+    return {
+      id: zoneId,
+      name: zone?.name || zoneId,
+      x: zone?.x,
+      y: zone?.y,
+      density: state?.current || 0,
+      riskLevel: state?.riskLevel || 'low',
+      waitTime: state?.waitTime || 0
     };
+  });
 
-    // Log analytics event to Firebase
-    await logAnalyticsEvent('route_calculated', {
-      from,
-      to,
-      steps: result.path.length,
-      score: parseInt(score),
-      preference
-    });
+  const totalWait = routeDetails.reduce((sum, z) => sum + z.waitTime, 0);
+  const avgDensity = routeDetails.reduce((sum, z) => sum + z.density, 0) / routeDetails.length;
+  const score = calculateRouteScore(routeDetails);
 
-    logger.info('Route calculated successfully', { 
-      from, 
-      to, 
-      steps: result.path.length,
-      score 
-    });
+  const response = {
+    route: routeDetails,
+    totalSteps: result.path.length,
+    estimatedTime: Math.ceil(result.path.length * 2 + totalWait * 0.3),
+    totalWaitTime: totalWait,
+    avgCrowdDensity: avgDensity.toFixed(3),
+    routeScore: parseInt(score),
+    preference,
+    timestamp: new Date().toISOString()
+  };
 
-    res.json(response);
-  } catch (error) {
-    logger.error('Route calculation error', { error: error.message, from, to });
-    res.status(500).json({ error: 'Failed to calculate route' });
-  }
-});
+  // Log analytics event to Firebase
+  await logAnalyticsEvent('route_calculated', {
+    from,
+    to,
+    steps: result.path.length,
+    score: parseInt(score),
+    preference
+  });
+  
+  // Write metric to Cloud Monitoring
+  await writeMetric('navigation/route_score', parseInt(score), { 
+    from, 
+    to, 
+    preference 
+  });
+
+  logger.info('Route calculated successfully', { 
+    from, 
+    to, 
+    steps: result.path.length,
+    score 
+  });
+
+  res.status(HTTP_STATUS.OK).json(response);
+}));
 
 /**
  * GET /api/navigation/zones
@@ -281,26 +288,21 @@ router.post('/route', [
  * 
  * @caching Cacheable for 60 seconds
  */
-router.get('/zones', (req, res) => {
-  try {
-    const zones = getZones();
-    const zoneList = zones.map(z => ({ 
-      id: z.id, 
-      name: z.name, 
-      x: z.x, 
-      y: z.y 
-    }));
+router.get('/zones', asyncHandler(async (req, res) => {
+  const zones = getZones();
+  const zoneList = zones.map(z => ({ 
+    id: z.id, 
+    name: z.name, 
+    x: z.x, 
+    y: z.y 
+  }));
 
-    res.set('Cache-Control', 'public, max-age=60');
-    res.json({ 
-      zones: zoneList,
-      count: zoneList.length,
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    logger.error('Failed to get zones', { error: error.message });
-    res.status(500).json({ error: 'Failed to retrieve zones' });
-  }
-});
+  res.set('Cache-Control', `public, max-age=${CACHE_TTL.MEDIUM / 1000}`);
+  res.status(HTTP_STATUS.OK).json({ 
+    zones: zoneList,
+    count: zoneList.length,
+    timestamp: new Date().toISOString()
+  });
+}));
 
 module.exports = router;

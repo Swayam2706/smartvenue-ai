@@ -4,6 +4,10 @@ import { useAppStore } from './store/appStore';
 import Layout from './components/Layout/Layout';
 import ErrorBoundary from './components/ErrorBoundary';
 import ProtectedRoute from './components/Auth/ProtectedRoute';
+import { initializeFirebase, trackPageView } from './config/firebase';
+
+// Initialize Firebase on app load
+initializeFirebase();
 
 // Lazy load all pages
 const LandingPage    = lazy(() => import('./pages/LandingPage'));
@@ -36,6 +40,9 @@ export default function App() {
 
   useEffect(() => {
     initWebSocket();
+    
+    // Track initial page view
+    trackPageView(window.location.pathname, document.title);
   }, []);
 
   return (

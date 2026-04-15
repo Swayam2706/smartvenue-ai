@@ -13,6 +13,10 @@ const {
   getSystemMetrics 
 } = require('../utils/performance');
 const { cache } = require('../utils/cache');
+const googleCloudIntegration = require('../services/googleCloudIntegration');
+const analyticsService = require('../services/analyticsService');
+const { asyncHandler } = require('../utils/errorHandler');
+const { HTTP_STATUS } = require('../utils/constants');
 const logger = require('../utils/logger');
 
 const router = express.Router();
@@ -122,3 +126,72 @@ router.get('/health', (req, res) => {
 });
 
 module.exports = router;
+
+/**
+ * GET /api/monitoring/google-cloud
+ * Get Google Cloud services status and integration coverage
+ * 
+ * @route GET /api/monitoring/google-cloud
+ * @access Admin
+ * @returns {Object} Google Cloud services status
+ */
+router.get('/google-cloud', authenticate, adminOnly, asyncHandler(async (req, res) => {
+  const status = googleCloudIntegration.getServiceStatus();
+  
+  res.status(HTTP_STATUS.OK).json({
+    ...status,
+    timestamp: new Date().toISOString()
+  });
+  
+  logger.info('Google Cloud status retrieved', { 
+    admin: req.user.username,
+    coverage: status.summary.coverage
+  });
+}));
+
+/**
+ * GET /api/monitoring/analytics
+ * Get analytics summary
+ * 
+ * @route GET /api/monitoring/analytics
+ * @access Admin
+ * @returns {Object} Analytics summary
+ */
+router.get('/analytics', authenticate, adminOnly, asyncHandler(async (req, res) => {
+  const hours = parseInt(req.query.hours) || 24;
+  const summary = analyticsService.getAnalyticsSummary(hours);
+  
+  res.status(HTTP_STATUS.OK).json({
+    analytics: summary,
+    timestamp: new Date().toISOString()
+  });
+  
+  logger.info('Analytics summary retrieved', { 
+    admin: req.user.username,
+    hours,
+    totalEvents: summary.totalEvents
+  });
+}));
+
+/**
+ * POST /api/monitoring/analytics/export
+ * Export analytics data to Cloud Storage
+ * 
+ * @route POST /api/monitoring/analytics/export
+ * @access Admin
+ * @returns {Object} Export result with storage URL
+ */
+router.post('/analytics/export', authenticate, adminOnly, asyncHandler(async (req, res) => {
+  const url = await analyticsService.exportToStorage();
+  
+  res.status(HTTP_STATUS.CREATED).json({
+    message: 'Analytics exported successfully',
+    url,
+    timestamp: new Date().toISOString()
+  });
+  
+  logger.info('Analytics exported', { 
+    admin: req.user.username,
+    url
+  });
+}));

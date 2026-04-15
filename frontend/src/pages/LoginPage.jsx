@@ -4,7 +4,7 @@ import { Zap, Eye, EyeOff, Loader, Shield, AlertCircle, Mail, Lock } from 'lucid
 import axios from 'axios';
 import { useAppStore } from '../store/appStore';
 import toast from 'react-hot-toast';
-import { logAnalyticsEvent, firebaseSignIn, hasFirebaseConfig, getFirebaseAuthError } from '../config/firebase';
+import { signInWithEmail, signInWithGoogle, isFirebaseConfigured, getFirebaseErrorMessage } from '../config/firebase';
 import { usePageTitle } from '../hooks/usePageTitle';
 
 export default function LoginPage() {
@@ -12,9 +12,11 @@ export default function LoginPage() {
   const [form, setForm]       = useState({ username: '', password: '' });
   const [showPass, setShowPass] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
   const [errors, setErrors]   = useState({});
   const { login }             = useAppStore();
   const navigate              = useNavigate();
+  const hasFirebase           = isFirebaseConfigured();
 
   const validate = useCallback(() => {
     const e = {};
@@ -38,11 +40,10 @@ export default function LoginPage() {
 
     try {
       // Firebase Auth — if email format and Firebase configured
-      if (hasFirebaseConfig && form.username.includes('@')) {
-        const result = await firebaseSignIn(form.username.trim(), form.password);
+      if (hasFirebase && form.username.includes('@')) {
+        const result = await signInWithEmail(form.username.trim(), form.password);
         login(result.user, result.token);
         toast.success(`Welcome back, ${result.user.name}! 👋`);
-        logAnalyticsEvent('admin_login', { method: 'firebase' });
         navigate('/dashboard');
         return;
       }
@@ -54,7 +55,6 @@ export default function LoginPage() {
       });
       login(res.data.user, res.data.token);
       toast.success(`Welcome back, ${res.data.user.name}! 👋`);
-      logAnalyticsEvent('admin_login', { role: res.data.user.role });
       navigate('/dashboard');
     } catch (err) {
       // Demo mode fallback
@@ -68,7 +68,7 @@ export default function LoginPage() {
         navigate('/dashboard');
       } else {
         const msg = err.code
-          ? getFirebaseAuthError(err.code)
+          ? getFirebaseErrorMessage(err.code)
           : err.response?.data?.error || 'Invalid credentials';
         setErrors({ form: msg });
         toast.error(msg);
@@ -76,7 +76,27 @@ export default function LoginPage() {
     } finally {
       setLoading(false);
     }
-  }, [form, validate, login, navigate]);
+  }, [form, validate, login, navigate, hasFirebase]);
+
+  const handleGoogleSignIn = useCallback(async () => {
+    setGoogleLoading(true);
+    setErrors({});
+    
+    try {
+      const result = await signInWithGoogle();
+      login(result.user, result.token);
+      toast.success(`Welcome back, ${result.user.name}! 👋`);
+      navigate('/dashboard');
+    } catch (err) {
+      if (err.code !== 'auth/popup-closed-by-user' && err.code !== 'auth/cancelled-popup-request') {
+        const msg = getFirebaseErrorMessage(err.code);
+        setErrors({ form: msg });
+        toast.error(msg);
+      }
+    } finally {
+      setGoogleLoading(false);
+    }
+  }, [login, navigate]);
 
   return (
     <div className="min-h-screen hero-bg grid-bg flex items-center justify-center p-4">
@@ -169,6 +189,41 @@ export default function LoginPage() {
             </button>
           </form>
 
+          {/* Divider */}
+          {hasFirebase && (
+            <>
+              <div className="relative my-6">
+                <div className="absolute inset-0 flex items-center">
+                  <div className="w-full border-t border-slate-700/50"></div>
+                </div>
+                <div className="relative flex justify-center text-xs">
+                  <span className="px-3 bg-slate-900/80 text-slate-500">Or continue with</span>
+                </div>
+              </div>
+
+              {/* Google Sign In */}
+              <button
+                type="button"
+                onClick={handleGoogleSignIn}
+                disabled={googleLoading || loading}
+                className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-white hover:bg-gray-50 text-gray-800 font-medium rounded-xl transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed shadow-sm hover:shadow-md"
+                aria-busy={googleLoading}
+              >
+                {googleLoading ? (
+                  <Loader size={18} className="animate-spin" aria-hidden="true" />
+                ) : (
+                  <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+                    <path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908c1.702-1.567 2.684-3.874 2.684-6.615z"/>
+                    <path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.184l-2.908-2.258c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332C2.438 15.983 5.482 18 9 18z"/>
+                    <path fill="#FBBC05" d="M3.964 10.707c-.18-.54-.282-1.117-.282-1.707 0-.593.102-1.17.282-1.709V4.958H.957C.347 6.173 0 7.548 0 9c0 1.452.348 2.827.957 4.042l3.007-2.335z"/>
+                    <path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0 5.482 0 2.438 2.017.957 4.958L3.964 7.29C4.672 5.163 6.656 3.58 9 3.58z"/>
+                  </svg>
+                )}
+                <span>{googleLoading ? 'Signing in...' : 'Sign in with Google'}</span>
+              </button>
+            </>
+          )}
+
           {/* Demo credentials */}
           <div className="mt-5 p-3.5 bg-slate-800/50 rounded-xl border border-slate-700/50" aria-label="Demo credentials">
             <p className="text-xs font-medium text-slate-400 mb-2">Demo Credentials</p>
@@ -181,7 +236,7 @@ export default function LoginPage() {
                 <dt className="text-slate-500">Operator:</dt>
                 <dd className="text-slate-300 font-mono">operator / operator123</dd>
               </div>
-              {hasFirebaseConfig && (
+              {hasFirebase && (
                 <div className="flex justify-between pt-1 border-t border-slate-700/50 mt-1">
                   <dt className="text-emerald-500">Firebase:</dt>
                   <dd className="text-slate-300">use your email</dd>

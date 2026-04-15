@@ -3,7 +3,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { Zap, Eye, EyeOff, Loader, User, Mail, Lock, AlertCircle, CheckCircle } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { useAppStore } from '../store/appStore';
-import { firebaseSignUp, getFirebaseAuthError, hasFirebaseConfig } from '../config/firebase';
+import { createUserWithEmail, signUpWithGoogle, isFirebaseConfigured, getFirebaseErrorMessage } from '../config/firebase';
 import { usePageTitle } from '../hooks/usePageTitle';
 
 // Password strength checker
@@ -29,10 +29,12 @@ export default function SignupPage() {
   const [form, setForm]       = useState({ name: '', email: '', password: '', confirm: '' });
   const [showPw, setShowPw]   = useState(false);
   const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
   const [errors, setErrors]   = useState({});
   const { login }             = useAppStore();
   const navigate              = useNavigate();
   const strength              = getPasswordStrength(form.password);
+  const hasFirebase           = isFirebaseConfigured();
 
   const validate = useCallback(() => {
     const e = {};
@@ -58,8 +60,8 @@ export default function SignupPage() {
     setLoading(true);
 
     try {
-      if (hasFirebaseConfig) {
-        const result = await firebaseSignUp(form.name.trim(), form.email.trim(), form.password);
+      if (hasFirebase) {
+        const result = await createUserWithEmail(form.name.trim(), form.email.trim(), form.password);
         login(result.user, result.token);
         toast.success(`Welcome to VenuroX, ${result.user.name}! 🎉`);
       } else {
@@ -69,13 +71,33 @@ export default function SignupPage() {
       }
       navigate('/dashboard');
     } catch (err) {
-      const msg = getFirebaseAuthError(err.code) || err.message;
+      const msg = getFirebaseErrorMessage(err.code) || err.message;
       setErrors({ form: msg });
       toast.error(msg);
     } finally {
       setLoading(false);
     }
-  }, [form, validate, login, navigate]);
+  }, [form, validate, login, navigate, hasFirebase]);
+
+  const handleGoogleSignUp = useCallback(async () => {
+    setGoogleLoading(true);
+    setErrors({});
+    
+    try {
+      const result = await signUpWithGoogle();
+      login(result.user, result.token);
+      toast.success(`Welcome to VenuroX, ${result.user.name}! 🎉`);
+      navigate('/dashboard');
+    } catch (err) {
+      if (err.code !== 'auth/popup-closed-by-user' && err.code !== 'auth/cancelled-popup-request') {
+        const msg = getFirebaseErrorMessage(err.code);
+        setErrors({ form: msg });
+        toast.error(msg);
+      }
+    } finally {
+      setGoogleLoading(false);
+    }
+  }, [login, navigate]);
 
   return (
     <div className="min-h-screen hero-bg grid-bg flex items-center justify-center p-4">
@@ -207,6 +229,41 @@ export default function SignupPage() {
               {loading ? <><Loader size={16} className="animate-spin" aria-hidden="true" /> Creating account...</> : 'Create Account'}
             </button>
           </form>
+
+          {/* Divider */}
+          {hasFirebase && (
+            <>
+              <div className="relative my-6">
+                <div className="absolute inset-0 flex items-center">
+                  <div className="w-full border-t border-slate-700/50"></div>
+                </div>
+                <div className="relative flex justify-center text-xs">
+                  <span className="px-3 bg-slate-900/80 text-slate-500">Or continue with</span>
+                </div>
+              </div>
+
+              {/* Google Sign Up */}
+              <button
+                type="button"
+                onClick={handleGoogleSignUp}
+                disabled={googleLoading || loading}
+                className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-white hover:bg-gray-50 text-gray-800 font-medium rounded-xl transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed shadow-sm hover:shadow-md"
+                aria-busy={googleLoading}
+              >
+                {googleLoading ? (
+                  <Loader size={18} className="animate-spin" aria-hidden="true" />
+                ) : (
+                  <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+                    <path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908c1.702-1.567 2.684-3.874 2.684-6.615z"/>
+                    <path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.184l-2.908-2.258c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332C2.438 15.983 5.482 18 9 18z"/>
+                    <path fill="#FBBC05" d="M3.964 10.707c-.18-.54-.282-1.117-.282-1.707 0-.593.102-1.17.282-1.709V4.958H.957C.347 6.173 0 7.548 0 9c0 1.452.348 2.827.957 4.042l3.007-2.335z"/>
+                    <path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0 5.482 0 2.438 2.017.957 4.958L3.964 7.29C4.672 5.163 6.656 3.58 9 3.58z"/>
+                  </svg>
+                )}
+                <span>{googleLoading ? 'Signing up...' : 'Sign up with Google'}</span>
+              </button>
+            </>
+          )}
 
           <p className="text-center text-sm text-slate-400 mt-6">
             Already have an account?{' '}

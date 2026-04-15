@@ -17,6 +17,9 @@ const { body, validationResult } = require('express-validator');
 const { authenticate } = require('../middleware/auth');
 const logger = require('../utils/logger');
 const { trackAnalyticsEvent } = require('../services/firebaseService');
+const { logAnalyticsEvent, createCustomToken } = require('../config/firebaseAdmin');
+const { asyncHandler, ValidationError, AuthenticationError, ConfigurationError } = require('../utils/errorHandler');
+const { HTTP_STATUS, SECURITY, VALIDATION } = require('../utils/constants');
 
 const router = express.Router();
 
@@ -25,9 +28,6 @@ const router = express.Router();
  * Passwords: admin123, operator123 (for demo purposes)
  * @constant {Array<Object>}
  */
-// Use bcrypt rounds of 12 for production-grade security
-const BCRYPT_ROUNDS = 12;
-
 const admins = [
   {
     id: '1',
@@ -48,10 +48,6 @@ const admins = [
     lockedUntil: null
   }
 ];
-
-// Account lockout configuration
-const MAX_LOGIN_ATTEMPTS = 5;
-const LOCKOUT_DURATION = 15 * 60 * 1000; // 15 minutes
 
 /**
  * POST /api/auth/login
@@ -85,87 +81,89 @@ const LOCKOUT_DURATION = 15 * 60 * 1000; // 15 minutes
  * }
  */
 router.post('/login', [
-  body('username').trim().notEmpty().isLength({ max: 50 }).withMessage('Username required'),
-  body('password').notEmpty().isLength({ max: 100 }).withMessage('Password required')
-], async (req, res) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      logger.warn('Login validation failed', { errors: errors.array() });
-      return res.status(400).json({ errors: errors.array() });
-    }
+  body('username').trim().notEmpty().isLength({ max: VALIDATION.USERNAME_MAX }).withMessage('Username required'),
+  body('password').notEmpty().isLength({ max: SECURITY.PASSWORD_MAX_LENGTH }).withMessage('Password required')
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    logger.warn('Login validation failed', { errors: errors.array() });
+    throw new ValidationError('Validation failed', errors.array());
+  }
 
-    const secret = process.env.JWT_SECRET;
-    if (!secret) {
-      logger.error('JWT_SECRET not configured');
-      return res.status(500).json({ error: 'Server configuration error' });
-    }
+  const secret = process.env.JWT_SECRET;
+  if (!secret) {
+    logger.error('JWT_SECRET not configured');
+    throw new ConfigurationError('JWT_SECRET not configured');
+  }
 
-    const { username, password } = req.body;
-    const admin = admins.find(a => a.username === username);
+  const { username, password } = req.body;
+  const admin = admins.find(a => a.username === username);
 
-    // Constant-time comparison to prevent timing attacks
-    if (!admin) {
-      await bcrypt.compare(password, '$2a$12$invalidhashfortimingnormalization');
-      logger.warn('Login attempt with invalid username', { username });
-      
-      // Track failed login
-      trackAnalyticsEvent('login_failed', {
-        username,
-        reason: 'invalid_username',
-        timestamp: new Date().toISOString()
-      });
-      
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    // Demo mode: accept known demo passwords OR bcrypt match
-    const demoPw = { admin: 'admin123', operator: 'operator123' };
-    const isDemo = password === demoPw[username];
-    const isBcrypt = await bcrypt.compare(password, admin.password);
-
-    if (!isDemo && !isBcrypt) {
-      logger.warn('Login attempt with invalid password', { username });
-      
-      // Track failed login
-      trackAnalyticsEvent('login_failed', {
-        username,
-        reason: 'invalid_password',
-        timestamp: new Date().toISOString()
-      });
-      
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    const token = jwt.sign(
-      { id: admin.id, username: admin.username, role: admin.role, name: admin.name },
-      secret,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
-    );
-
-    // Track successful login
-    trackAnalyticsEvent('login_success', {
-      user_id: admin.id,
-      username: admin.username,
-      role: admin.role,
+  // Constant-time comparison to prevent timing attacks
+  if (!admin) {
+    await bcrypt.compare(password, '$2a$12$invalidhashfortimingnormalization');
+    logger.warn('Login attempt with invalid username', { username });
+    
+    // Track failed login to Firebase
+    await logAnalyticsEvent('login_failed', {
+      username,
+      reason: 'invalid_username',
       timestamp: new Date().toISOString()
     });
+    
+    throw new AuthenticationError('Invalid credentials');
+  }
 
-    res.json({
-      token,
-      user: { id: admin.id, username: admin.username, role: admin.role, name: admin.name }
+  // Demo mode: accept known demo passwords OR bcrypt match
+  const demoPw = { admin: 'admin123', operator: 'operator123' };
+  const isDemo = password === demoPw[username];
+  const isBcrypt = await bcrypt.compare(password, admin.password);
+
+  if (!isDemo && !isBcrypt) {
+    logger.warn('Login attempt with invalid password', { username });
+    
+    // Track failed login to Firebase
+    await logAnalyticsEvent('login_failed', {
+      username,
+      reason: 'invalid_password',
+      timestamp: new Date().toISOString()
     });
     
-    logger.info('User logged in successfully', { 
-      userId: admin.id, 
-      username: admin.username, 
-      role: admin.role 
-    });
-  } catch (error) {
-    logger.error('Login error', { error: error.message });
-    res.status(500).json({ error: 'Login failed' });
+    throw new AuthenticationError('Invalid credentials');
   }
-});
+
+  const token = jwt.sign(
+    { id: admin.id, username: admin.username, role: admin.role, name: admin.name },
+    secret,
+    { expiresIn: process.env.JWT_EXPIRES_IN || SECURITY.JWT_EXPIRY }
+  );
+
+  // Create Firebase custom token for cross-platform auth
+  try {
+    await createCustomToken(admin.id, { role: admin.role, username: admin.username });
+  } catch (error) {
+    logger.debug('Firebase custom token creation skipped', { error: error.message });
+  }
+
+  // Track successful login to Firebase
+  await logAnalyticsEvent('login_success', {
+    user_id: admin.id,
+    username: admin.username,
+    role: admin.role,
+    timestamp: new Date().toISOString()
+  });
+
+  res.status(HTTP_STATUS.OK).json({
+    token,
+    user: { id: admin.id, username: admin.username, role: admin.role, name: admin.name }
+  });
+  
+  logger.info('User logged in successfully', { 
+    userId: admin.id, 
+    username: admin.username, 
+    role: admin.role 
+  });
+}));
 
 /**
  * GET /api/auth/me
@@ -187,23 +185,18 @@ router.post('/login', [
  *   }
  * }
  */
-router.get('/me', authenticate, (req, res) => {
-  try {
-    // Track analytics event
-    trackAnalyticsEvent('user_profile_viewed', {
-      user_id: req.user.id,
-      username: req.user.username,
-      role: req.user.role
-    });
-    
-    res.json({ user: req.user });
-    
-    logger.debug('User profile retrieved', { userId: req.user.id });
-  } catch (error) {
-    logger.error('Error retrieving user profile', { error: error.message });
-    res.status(500).json({ error: 'Failed to retrieve user profile' });
-  }
-});
+router.get('/me', authenticate, asyncHandler(async (req, res) => {
+  // Track analytics event to Firebase
+  await logAnalyticsEvent('user_profile_viewed', {
+    user_id: req.user.id,
+    username: req.user.username,
+    role: req.user.role
+  });
+  
+  res.status(HTTP_STATUS.OK).json({ user: req.user });
+  
+  logger.debug('User profile retrieved', { userId: req.user.id });
+}));
 
 /**
  * POST /api/auth/logout
@@ -220,23 +213,18 @@ router.get('/me', authenticate, (req, res) => {
  *   "message": "Logged out successfully"
  * }
  */
-router.post('/logout', authenticate, (req, res) => {
-  try {
-    // Track analytics event
-    trackAnalyticsEvent('logout', {
-      user_id: req.user.id,
-      username: req.user.username,
-      role: req.user.role,
-      timestamp: new Date().toISOString()
-    });
-    
-    res.json({ message: 'Logged out successfully' });
-    
-    logger.info('User logged out', { userId: req.user.id, username: req.user.username });
-  } catch (error) {
-    logger.error('Logout error', { error: error.message });
-    res.status(500).json({ error: 'Logout failed' });
-  }
-});
+router.post('/logout', authenticate, asyncHandler(async (req, res) => {
+  // Track analytics event to Firebase
+  await logAnalyticsEvent('logout', {
+    user_id: req.user.id,
+    username: req.user.username,
+    role: req.user.role,
+    timestamp: new Date().toISOString()
+  });
+  
+  res.status(HTTP_STATUS.OK).json({ message: 'Logged out successfully' });
+  
+  logger.info('User logged out', { userId: req.user.id, username: req.user.username });
+}));
 
 module.exports = router;
