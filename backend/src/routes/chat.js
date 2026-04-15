@@ -1,12 +1,33 @@
+/**
+ * @fileoverview Chat Routes - AI-powered venue assistant with Gemini integration
+ * @module routes/chat
+ * @requires express
+ * @requires express-validator
+ * @requires ../simulation/crowdSimulator
+ * @requires ../utils/logger
+ * @requires ../services/firebaseService
+ */
+
 const express = require('express');
 const { body, validationResult } = require('express-validator');
 const { getCurrentState, getZones } = require('../simulation/crowdSimulator');
+const logger = require('../utils/logger');
+const { trackAnalyticsEvent } = require('../services/firebaseService');
 
 const router = express.Router();
 
-// Simple in-memory rate limiter for Gemini (15 RPM free tier)
+/**
+ * In-memory rate limiter for Gemini API (15 RPM free tier)
+ * @type {Array<number>}
+ */
 const geminiLog = [];
 
+/**
+ * Checks if Gemini API rate limit has been exceeded
+ * Implements sliding window rate limiting (14 requests per minute)
+ * 
+ * @returns {boolean} True if rate limited, false otherwise
+ */
 function isGeminiRateLimited() {
   const now = Date.now();
   const recent = geminiLog.filter(t => now - t < 60000);
@@ -17,7 +38,18 @@ function isGeminiRateLimited() {
   return false;
 }
 
-// Rule-based fallback responses
+/**
+ * Generates rule-based response for common venue queries
+ * Fallback when AI is unavailable or rate limited
+ * 
+ * @param {string} query - User query text
+ * @param {Object} crowdState - Current crowd state from simulator
+ * @returns {string} Formatted response with recommendations
+ * 
+ * @example
+ * getRuleBasedResponse("where is the nearest restroom?", crowdState)
+ * // returns "🚻 The least crowded restroom right now is..."
+ */
 function getRuleBasedResponse(query, crowdState) {
   const q = query.toLowerCase();
 
@@ -77,7 +109,21 @@ function getRuleBasedResponse(query, crowdState) {
   return `🤖 I can help you with: finding **restrooms**, **food courts**, **exit routes**, **parking**, **VIP lounge**, or **crowd status**. What would you like to know?`;
 }
 
-// Gemini 1.5 Flash (correct model, not deprecated gemini-pro)
+/**
+ * Calls Google Gemini 1.5 Flash API for AI-powered responses
+ * Includes venue context and current crowd status
+ * 
+ * @param {string} query - User query text
+ * @param {Object} context - Venue context (critical zones, best options, etc.)
+ * @returns {Promise<string|null>} AI response or null if unavailable
+ * 
+ * @example
+ * await getAIResponse("What's the best exit?", {
+ *   criticalZones: ["North Stand"],
+ *   bestGate: "Gate B",
+ *   totalZones: 20
+ * })
+ */
 async function getAIResponse(query, context) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey || apiKey === 'your_gemini_api_key_here') return null;
@@ -119,34 +165,86 @@ Respond in 1-2 sentences. Be specific and helpful. Use relevant emojis.`
   }
 }
 
-// POST /api/chat/message
+/**
+ * POST /api/chat/message
+ * Processes user chat messages with AI or rule-based responses
+ * 
+ * @route POST /api/chat/message
+ * @param {string} message - User message (max 500 characters)
+ * @access Public
+ * @returns {Object} 200 - Chat response with AI flag
+ * @returns {Object} 400 - Validation error
+ * @returns {Object} 500 - Internal server error
+ * 
+ * @example
+ * Request body:
+ * {
+ *   "message": "Where is the nearest restroom?"
+ * }
+ * 
+ * Response:
+ * {
+ *   "response": "🚻 The least crowded restroom right now is...",
+ *   "usedAI": true,
+ *   "timestamp": "2024-01-15T10:30:00.000Z"
+ * }
+ */
 router.post('/message', [
   body('message').trim().notEmpty().withMessage('Message required').isLength({ max: 500 })
 ], async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      logger.warn('Chat message validation failed', { errors: errors.array() });
+      return res.status(400).json({ errors: errors.array() });
+    }
 
-  const { message } = req.body;
-  const crowdState = getCurrentState();
+    const { message } = req.body;
+    const crowdState = getCurrentState();
 
-  const zones = Object.values(crowdState);
-  const context = {
-    totalZones: zones.length,
-    criticalZones: zones.filter(z => z.riskLevel === 'critical').map(z => z.name),
-    highRiskZones: zones.filter(z => z.riskLevel === 'high').map(z => z.name),
-    bestGate: zones.filter(z => z.id?.includes('gate')).sort((a, b) => a.current - b.current)[0]?.name,
-    bestFood: zones.filter(z => z.id?.includes('food')).sort((a, b) => a.current - b.current)[0]?.name,
-    bestRestroom: zones.filter(z => z.id?.includes('restroom')).sort((a, b) => a.current - b.current)[0]?.name
-  };
+    const zones = Object.values(crowdState);
+    const context = {
+      totalZones: zones.length,
+      criticalZones: zones.filter(z => z.riskLevel === 'critical').map(z => z.name),
+      highRiskZones: zones.filter(z => z.riskLevel === 'high').map(z => z.name),
+      bestGate: zones.filter(z => z.id?.includes('gate')).sort((a, b) => a.current - b.current)[0]?.name,
+      bestFood: zones.filter(z => z.id?.includes('food')).sort((a, b) => a.current - b.current)[0]?.name,
+      bestRestroom: zones.filter(z => z.id?.includes('restroom')).sort((a, b) => a.current - b.current)[0]?.name
+    };
 
-  let response = await getAIResponse(message, context);
-  const usedAI = !!response;
+    let response = await getAIResponse(message, context);
+    const usedAI = !!response;
 
-  if (!response) {
-    response = getRuleBasedResponse(message, crowdState);
+    if (!response) {
+      response = getRuleBasedResponse(message, crowdState);
+    }
+
+    // Track analytics event
+    trackAnalyticsEvent('chat_message_sent', {
+      message_length: message.length,
+      used_ai: usedAI,
+      critical_zones: context.criticalZones.length,
+      query_type: message.toLowerCase().includes('restroom') ? 'restroom' :
+                  message.toLowerCase().includes('food') ? 'food' :
+                  message.toLowerCase().includes('exit') ? 'exit' : 'general'
+    });
+
+    res.json({ response, usedAI, timestamp: new Date().toISOString() });
+    
+    logger.info('Chat message processed', { 
+      messageLength: message.length, 
+      usedAI, 
+      criticalZones: context.criticalZones.length 
+    });
+  } catch (error) {
+    logger.error('Error processing chat message', { error: error.message });
+    res.status(500).json({ 
+      error: 'Failed to process message',
+      response: '🤖 Sorry, I encountered an error. Please try again.',
+      usedAI: false,
+      timestamp: new Date().toISOString()
+    });
   }
-
-  res.json({ response, usedAI, timestamp: new Date().toISOString() });
 });
 
 module.exports = router;

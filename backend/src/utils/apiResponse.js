@@ -1,29 +1,40 @@
 /**
- * Standardized API response helpers
- * Ensures consistent response shape across all endpoints
+ * API Response Utilities
+ * Standardized response formatting
+ * 
+ * @module utils/apiResponse
  */
 
-const success = (res, data, statusCode = 200) => {
-  res.status(statusCode).json({
+/**
+ * Creates success response
+ * 
+ * @param {*} data - Response data
+ * @param {string} message - Success message
+ * @returns {Object} Formatted success response
+ */
+function successResponse(data, message = 'Success') {
+  return {
     success: true,
     data,
-    timestamp: new Date().toISOString(),
-  });
-};
+    message,
+    timestamp: new Date().toISOString()
+  };
+}
 
-const error = (res, message, statusCode = 400, details = null) => {
-  const body = { success: false, error: message, timestamp: new Date().toISOString() };
-  if (details) body.details = details;
-  res.status(statusCode).json(body);
-};
+/**
+ * Creates error response
+ * 
+ * @param {string} error - Error message
+ * @param {number} statusCode - HTTP status code
+ * @returns {Object} Formatted error response
+ */
+function errorResponse(error, statusCode = 500) {
+  return {
+    success: false,
+    error,
+    statusCode,
+    timestamp: new Date().toISOString()
+  };
+}
 
-const paginated = (res, data, total, page, limit) => {
-  res.json({
-    success: true,
-    data,
-    pagination: { total, page, limit, pages: Math.ceil(total / limit) },
-    timestamp: new Date().toISOString(),
-  });
-};
-
-module.exports = { success, error, paginated };
+module.exports = { successResponse, errorResponse };

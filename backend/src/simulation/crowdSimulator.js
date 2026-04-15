@@ -1,12 +1,19 @@
 /**
- * Crowd Simulator - Generates realistic real-time crowd data
- * Uses moving average + random variation to simulate crowd dynamics
+ * @fileoverview Crowd Simulator - Real-time crowd dynamics simulation engine
+ * @module simulation/crowdSimulator
+ * @description Generates realistic crowd data using moving averages and random variation
+ * Simulates natural crowd flow patterns with time-based multipliers
+ * @requires ../websocket/wsServer
+ * @requires ../config/firebaseAdmin
  */
 
 const { broadcast } = require('../websocket/wsServer');
 const { pushCrowdToFirebase } = require('../config/firebaseAdmin');
 
-// Venue zones definition
+/**
+ * Venue zones definition with capacity and coordinates
+ * @constant {Array<Object>}
+ */
 const ZONES = [
   { id: 'north-stand', name: 'North Stand', capacity: 8000, x: 50, y: 10 },
   { id: 'south-stand', name: 'South Stand', capacity: 8000, x: 50, y: 90 },
@@ -30,23 +37,50 @@ const ZONES = [
   { id: 'parking-south', name: 'Parking South', capacity: 2000, x: 50, y: 95 },
 ];
 
-// State: current crowd levels (0-1 ratio)
+/**
+ * Current crowd state for all zones
+ * @type {Object<string, Object>}
+ */
 let crowdState = {};
+
+/**
+ * Historical density data for prediction algorithms
+ * @type {Object<string, Array<number>>}
+ */
 let history = {};
 
-// Initialize state
+/**
+ * Simulation interval timer reference
+ * @type {NodeJS.Timeout|null}
+ */
+let simulationInterval = null;
+
+// Initialize state with predictions
 ZONES.forEach(zone => {
+  const initialDensity = Math.random() * 0.5 + 0.1;
   crowdState[zone.id] = {
     ...zone,
-    current: Math.random() * 0.5 + 0.1,
+    current: initialDensity,
     trend: (Math.random() - 0.5) * 0.02,
     waitTime: Math.floor(Math.random() * 15) + 2,
-    riskLevel: 'low'
+    riskLevel: getRiskLevel(initialDensity),
+    predictions: Array(5).fill(initialDensity)
   };
-  history[zone.id] = [];
+  history[zone.id] = [initialDensity];
 });
 
-// Time-based multipliers (simulate event lifecycle)
+/**
+ * Calculates time-based multiplier to simulate event lifecycle
+ * Models pre-game rush, peak attendance, and post-game dispersal
+ * 
+ * @returns {number} Multiplier value between 0.4 and 0.95
+ * 
+ * @example
+ * // Returns values like:
+ * // 0.4-0.8 during build-up phase
+ * // 0.8-0.95 during peak
+ * // 0.85-0.25 during dispersal
+ */
 function getTimeMultiplier() {
   const now = new Date();
   const minutes = now.getMinutes();
@@ -58,7 +92,17 @@ function getTimeMultiplier() {
   return 0.85 - (phase - 0.7) * 1.5; // Post-event dispersal
 }
 
-// Compute risk level from density
+/**
+ * Computes risk level classification from density value
+ * 
+ * @param {number} density - Crowd density ratio (0-1)
+ * @returns {string} Risk level: "low", "medium", "high", or "critical"
+ * 
+ * @example
+ * getRiskLevel(0.45) // returns "low"
+ * getRiskLevel(0.75) // returns "high"
+ * getRiskLevel(0.92) // returns "critical"
+ */
 function getRiskLevel(density) {
   if (density >= 0.85) return 'critical';
   if (density >= 0.7) return 'high';
@@ -66,7 +110,18 @@ function getRiskLevel(density) {
   return 'low';
 }
 
-// Predict next 15 minutes using moving average
+/**
+ * Predicts future density values using moving average algorithm
+ * Analyzes historical trends to forecast next 15 minutes (5 intervals)
+ * 
+ * @param {string} zoneId - Zone identifier
+ * @param {number} currentDensity - Current density value (0-1)
+ * @returns {Array<number>} Array of 5 predicted density values
+ * 
+ * @example
+ * predictDensity("north-stand", 0.75)
+ * // returns [0.76, 0.78, 0.80, 0.82, 0.84]
+ */
 function predictDensity(zoneId, currentDensity) {
   const hist = history[zoneId].slice(-10);
   if (hist.length < 3) return Array(5).fill(currentDensity);
@@ -80,7 +135,29 @@ function predictDensity(zoneId, currentDensity) {
   });
 }
 
-// Main simulation tick
+/**
+ * Main simulation tick - Updates all zone states
+ * Applies random walk with mean reversion, time multipliers, and predictions
+ * Broadcasts updates via WebSocket and pushes to Firebase
+ * 
+ * @returns {Object} Updated crowd state for all zones
+ * 
+ * @example
+ * {
+ *   "north-stand": {
+ *     id: "north-stand",
+ *     name: "North Stand",
+ *     current: 0.75,
+ *     trend: 0.02,
+ *     waitTime: 12,
+ *     riskLevel: "high",
+ *     predictions: [0.76, 0.78, 0.80, 0.82, 0.84],
+ *     count: 6000,
+ *     capacity: 8000,
+ *     updatedAt: "2024-01-15T10:30:00.000Z"
+ *   }
+ * }
+ */
 function simulateTick() {
   const timeMultiplier = getTimeMultiplier();
   const updates = {};
@@ -130,27 +207,54 @@ function simulateTick() {
   return updates;
 }
 
-let simulationInterval = null;
-
+/**
+ * Starts the crowd simulation with 4-second intervals
+ * Prevents multiple simultaneous simulations
+ * 
+ * @returns {void}
+ */
 function startSimulation() {
   if (simulationInterval) return;
   simulationInterval = setInterval(simulateTick, 4000);
   console.log('🎯 Crowd simulation started (4s interval)');
 }
 
+/**
+ * Stops the crowd simulation
+ * Clears the interval timer
+ * 
+ * @returns {void}
+ */
 function stopSimulation() {
   if (simulationInterval) {
     clearInterval(simulationInterval);
     simulationInterval = null;
+    console.log('⏹️  Crowd simulation stopped');
   }
 }
 
+/**
+ * Retrieves current crowd state for all zones
+ * 
+ * @returns {Object<string, Object>} Current state object keyed by zone ID
+ */
 function getCurrentState() {
   return crowdState;
 }
 
+/**
+ * Retrieves static zone definitions
+ * 
+ * @returns {Array<Object>} Array of zone configuration objects
+ */
 function getZones() {
   return ZONES;
 }
 
-module.exports = { startSimulation, stopSimulation, getCurrentState, getZones, simulateTick };
+module.exports = { 
+  startSimulation, 
+  stopSimulation, 
+  getCurrentState, 
+  getZones, 
+  simulateTick 
+};

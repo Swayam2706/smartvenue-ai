@@ -4,7 +4,10 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const compression = require('compression');
+const cookieParser = require('cookie-parser');
 const { sanitizeBody } = require('./utils/sanitize');
+const { performanceMonitoring } = require('./utils/performance');
+const requestId = require('./middleware/requestId');
 const logger = require('./utils/logger');
 
 const authRoutes = require('./routes/auth');
@@ -14,13 +17,20 @@ const queueRoutes = require('./routes/queue');
 const alertRoutes = require('./routes/alerts');
 const chatRoutes = require('./routes/chat');
 const analyticsRoutes = require('./routes/analytics');
+const monitoringRoutes = require('./routes/monitoring');
 
 const app = express();
+
+// Request ID tracking
+app.use(requestId);
+
+// Performance monitoring
+app.use(performanceMonitoring());
 
 // Compression — reduces response size significantly
 app.use(compression());
 
-// Security headers
+// Security headers - Enhanced
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
@@ -32,6 +42,16 @@ app.use(helmet({
     }
   },
   crossOriginEmbedderPolicy: false,
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true
+  },
+  frameguard: { action: 'deny' },
+  noSniff: true,
+  xssFilter: true,
+  dnsPrefetchControl: { allow: false },
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' }
 }));
 
 // CORS — allow Firebase Hosting URL + local dev + Cloud Run
@@ -76,9 +96,12 @@ const authLimiter = rateLimit({
 app.use('/api/', limiter);
 app.use('/api/auth/login', authLimiter);
 
-// Body parsing
-app.use(express.json({ limit: '10kb' }));
-app.use(express.urlencoded({ extended: true }));
+// Cookie parser for CSRF protection
+app.use(cookieParser());
+
+// Body parsing with strict limits
+app.use(express.json({ limit: '10kb', strict: true }));
+app.use(express.urlencoded({ extended: true, limit: '10kb', parameterLimit: 50 }));
 
 // XSS sanitization on all request bodies
 app.use(sanitizeBody);
@@ -105,17 +128,30 @@ app.use('/api/queue', queueRoutes);
 app.use('/api/alerts', alertRoutes);
 app.use('/api/chat', chatRoutes);
 app.use('/api/analytics', analyticsRoutes);
+app.use('/api/monitoring', monitoringRoutes);
 
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
 });
 
-// Global error handler
+// Global error handler with request ID tracking
 app.use((err, req, res, next) => {
-  console.error(err.stack);
+  const requestId = req.headers['x-request-id'] || `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  
+  logger.error('Request error', {
+    requestId,
+    error: err.message,
+    stack: process.env.NODE_ENV !== 'production' ? err.stack : undefined,
+    path: req.path,
+    method: req.method,
+    ip: req.ip
+  });
+  
   res.status(err.status || 500).json({
-    error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message
+    error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message,
+    requestId,
+    code: err.code || 'INTERNAL_ERROR'
   });
 });
 
